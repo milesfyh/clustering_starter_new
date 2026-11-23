@@ -77,106 +77,140 @@ class FluxEquilibriumClustering:
         """
         # Hint: Start with computing centroid = X.mean(axis=0)
         X = np.asarray(X, dtype=float)
-        if X.ndim != 2 or len(X) == 0:
-            raise ValueError("X must be a nonempty two-dimensional array")
+        if X.ndim != 2 or X.shape[0] == 0:
+            raise ValueError("X must be a nonempty 2D array.")
 
-        n = len(X)
+        n = X.shape[0]
+        if n == 1:
+            self.w_ij = np.empty((1, 0), dtype=float)
+            self.flux = np.ones(1, dtype=float)
+            self.sinks = np.array([True], dtype=bool)
+            self.labels = np.array([0], dtype=int)
+            return self
+
         nodes = np.arange(n)
-        centroid_distances = np.linalg.norm(X - X.mean(axis=0), axis=1)
 
-        squared_distances = np.empty((n, n))
-        for i, point in enumerate(X):
-            differences = X - point
-            squared_distances[i] = np.einsum("ij,ij->i", differences, differences)
+        # Step 1: Pre-compute centroid, centroid distances, sigma, and k-NN edge weights
+        centroid = X.mean(axis=0)
+        d = np.linalg.norm(X - centroid, axis=1)
 
-        sigma = self.sigma
-        if sigma is None:
-            if n > 1:
-                pairwise_distances = np.sqrt(squared_distances[np.triu_indices(n, k=1)])
-                sigma = 0.2 * np.median(pairwise_distances)
-            else:
-                sigma = 0.0
+        diff = X[:, None, :] - X[None, :, :]
+        sq_dists = np.einsum("ijk,ijk->ij", diff, diff)
+        dists = np.sqrt(sq_dists)
 
-        effective_k = min(self.k, n - 1)
-        np.fill_diagonal(squared_distances, np.inf)
-        neighbors = np.argsort(squared_distances, axis=1, kind="stable")[:, :effective_k].copy()
-        graph = np.zeros((n, n), dtype=bool)
-        graph[nodes[:, None], neighbors] = True
-        graph |= graph.T
-
-        transport_weights = np.zeros((n, n))
-        if sigma == 0:
-            transport_weights[graph] = squared_distances[graph] == 0
+        if self.sigma is None:
+            upper_tri = dists[np.triu_indices(n, k=1)]
+            sigma = 0.2 * float(np.median(upper_tri))
         else:
-            scaled_distances = np.sqrt(squared_distances[graph]) / sigma
-            transport_weights[graph] = np.exp(-(scaled_distances ** 2))
+            sigma = float(self.sigma)
 
-        w_ij = transport_weights[nodes[:, None], neighbors]
+        k_eff = min(self.k, n - 1)
+        sq_dists_no_self = sq_dists.copy()
+        np.fill_diagonal(sq_dists_no_self, np.inf)
+        knn_indices = np.argsort(sq_dists_no_self, axis=1, kind="stable")[:, :k_eff]
+        knn_sq_dists = sq_dists[nodes[:, None], knn_indices]
 
-        # Rows are senders, and columns are receivers.
-        downhill = centroid_distances[None, :] <= centroid_distances[:, None] + 0.1 * sigma
-        downhill_weights = transport_weights * downhill
+        if sigma > 0.0:
+            w_ij = np.exp(-knn_sq_dists / (sigma ** 2))
+        else:
+            w_ij = (knn_sq_dists == 0.0).astype(float)
 
-        flux = np.ones(n)
-        delta = np.zeros_like(downhill_weights)
-        outgoing = np.zeros(n)
-        totals = np.zeros(n)
+        # Step 2: Initialize stored flux f_i(0) = 1
+        flux = np.ones(n, dtype=float)
 
-        for iteration in range(self.T):
-            weights = downhill_weights
-            if iteration > 0 and self.beta != 0:
-                if self.beta is None:
-                    reinforcement = np.log1p(flux)
-                else:
-                    reinforcement = flux ** self.beta
-                weights = downhill_weights * reinforcement[None, :]
+        # Step 3: Simulate flow for T iterations
+        tau = 0.1 * sigma
+        downhill_mask = d[knn_indices] <= (d[:, None] + tau)
+        base_downhill_w = np.where(downhill_mask, w_ij, 0.0)
 
-            totals = weights.sum(axis=1)
-            outgoing = np.where(totals > 0, self.alpha * flux, 0.0)
-            np.divide(weights, totals[:, None], out=delta, where=totals[:, None] > 0)
-            delta[totals == 0] = 0.0
+        delta = np.zeros((n, k_eff), dtype=float)
+        outgoing = np.zeros(n, dtype=float)
+
+        for t in range(self.T):
+            if t == 0 or self.beta == 0:
+                w_tilde = base_downhill_w
+            elif self.beta is None:
+                phi = np.log1p(flux)
+                w_tilde = base_downhill_w * phi[knn_indices]
+            else:
+                phi = np.power(flux, self.beta)
+                w_tilde = base_downhill_w * phi[knn_indices]
+
+            denom = w_tilde.sum(axis=1)
+            has_outflow = denom > 0.0
+
+            delta.fill(0.0)
+            outgoing = np.where(has_outflow, self.alpha * flux, 0.0)
+            np.divide(
+                w_tilde,
+                denom[:, None],
+                out=delta,
+                where=has_outflow[:, None],
+            )
             delta *= outgoing[:, None]
-            flux = (flux - outgoing) + delta.sum(axis=0)
 
-        sinks = np.flatnonzero(outgoing < self.epsilon).tolist()
-        if not sinks:
-            sinks.append(int(centroid_distances.argmin()))
+            incoming = np.zeros(n, dtype=float)
+            np.add.at(incoming, knn_indices, delta)
+            flux = flux - outgoing + incoming
 
-        steepest = np.where((totals > 0) & (outgoing > 0), delta.argmax(axis=1), nodes)
+        # Step 4: Detect sinks (low outgoing flux, excluding depleted nodes)
+        sinks = (outgoing < self.epsilon) & (flux >= self.epsilon)
+        if not np.any(sinks):
+            sinks[int(np.argmin(d))] = True
+
+        # Step 5: Assign clusters via steepest downhill path with cycle detection
+        masked_delta = np.where(downhill_mask, delta, -np.inf)
+        has_downhill = downhill_mask.any(axis=1)
+        best_pos = np.argmax(masked_delta, axis=1)
+        steepest = np.where(has_downhill, knn_indices[nodes, best_pos], nodes)
 
         labels = np.full(n, -1, dtype=int)
-        labels[sinks] = np.arange(len(sinks))
+        next_label = 0
+        for sink_node in np.flatnonzero(sinks):
+            labels[sink_node] = next_label
+            next_label += 1
 
-        for start in nodes:
-            current = start
+        for i in range(n):
+            if labels[i] != -1:
+                continue
+
             path = []
             visited = set()
-            while labels[current] == -1:
-                visited.add(current)
-                path.append(current)
-                next_node = steepest[current]
+            curr = i
+
+            while labels[curr] == -1:
+                visited.add(curr)
+                path.append(curr)
+                next_node = int(steepest[curr])
                 if next_node in visited:
-                    labels[current] = len(sinks)
-                    sinks.append(int(current))
+                    sinks[curr] = True
+                    labels[curr] = next_label
+                    next_label += 1
                     break
-                current = next_node
-            labels[path] = labels[current]
+                curr = next_node
 
-        min_size = max(2, n // 20)
+            terminal_label = labels[curr]
+            for node in path:
+                labels[node] = terminal_label
+
+        # Step 6: Post-processing - merge small clusters (< s_min) into nearest larger cluster
+        s_min = max(2, n // 20)
         counts = np.bincount(labels)
-        large_clusters = np.flatnonzero(counts >= min_size)
-        small_clusters = np.flatnonzero(counts < min_size)
-        if large_clusters.size and small_clusters.size:
-            centroids = np.zeros((len(counts), X.shape[1]))
-            np.add.at(centroids, labels, X)
-            centroids /= counts[:, None]
-            merged_labels = np.arange(len(counts))
-            for cluster in small_clusters:
-                distances = np.linalg.norm(centroids[large_clusters] - centroids[cluster], axis=1)
-                merged_labels[cluster] = large_clusters[distances.argmin()]
-            labels = merged_labels[labels]
+        large_ids = np.flatnonzero(counts > s_min)
+        small_ids = np.flatnonzero(counts <= s_min)
 
-        sinks = np.asarray(sinks, dtype=int)
+        if len(large_ids) > 0 and len(small_ids) > 0:
+            cluster_centroids = np.zeros((len(counts), X.shape[1]), dtype=float)
+            np.add.at(cluster_centroids, labels, X)
+            cluster_centroids /= counts[:, None]
+
+            remap = np.arange(len(counts))
+            for cid in small_ids:
+                dists_to_large = np.linalg.norm(
+                    cluster_centroids[large_ids] - cluster_centroids[cid], axis=1
+                )
+                remap[cid] = large_ids[int(np.argmin(dists_to_large))]
+            labels = remap[labels]
 
         # ---- DO NOT CHANGE THE REST OF THIS METHOD ---- #
         # We require you maintain these attributes for testing purpose.
