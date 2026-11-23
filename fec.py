@@ -81,11 +81,14 @@ class FluxEquilibriumClustering:
             raise ValueError("X must be a nonempty 2D array.")
 
         n = X.shape[0]
-        if n == 1:
-            self.w_ij = np.empty((1, 0), dtype=float)
-            self.flux = np.ones(1, dtype=float)
-            self.sinks = np.array([True], dtype=bool)
-            self.labels = np.array([0], dtype=int)
+        k_eff = min(self.k, n - 1)
+        if k_eff < 0:
+            raise ValueError("k must be nonnegative.")
+        if k_eff == 0:
+            self.w_ij = np.empty((n, 0), dtype=float)
+            self.flux = np.ones(n, dtype=float)
+            self.sinks = np.ones(n, dtype=bool)
+            self.labels = np.arange(n)
             return self
 
         nodes = np.arange(n)
@@ -94,35 +97,49 @@ class FluxEquilibriumClustering:
         centroid = X.mean(axis=0)
         d = np.linalg.norm(X - centroid, axis=1)
 
-        diff = X[:, None, :] - X[None, :, :]
-        sq_dists = np.einsum("ijk,ijk->ij", diff, diff)
-        dists = np.sqrt(sq_dists)
+        # Compute one row at a time to avoid an n-by-n-by-dimension array.
+        sq_dists = np.empty((n, n))
+        for i, point in enumerate(X):
+            diff = X - point
+            sq_dists[i] = np.einsum("ij,ij->i", diff, diff)
 
         if self.sigma is None:
-            upper_tri = dists[np.triu_indices(n, k=1)]
-            sigma = 0.2 * float(np.median(upper_tri))
+            pairwise_distances = np.sqrt(sq_dists[np.triu_indices(n, k=1)])
+            sigma = 0.2 * float(np.median(pairwise_distances))
         else:
             sigma = float(self.sigma)
 
-        k_eff = min(self.k, n - 1)
-        sq_dists_no_self = sq_dists.copy()
-        np.fill_diagonal(sq_dists_no_self, np.inf)
-        knn_indices = np.argsort(sq_dists_no_self, axis=1, kind="stable")[:, :k_eff]
+        np.fill_diagonal(sq_dists, np.inf)
+        knn_indices = np.argsort(sq_dists, axis=1, kind="stable")[:, :k_eff].copy()
         knn_sq_dists = sq_dists[nodes[:, None], knn_indices]
 
+        tau = 0.1 * sigma
+        downhill_mask = d[knn_indices] <= (d[:, None] + tau)
         if sigma > 0.0:
-            w_ij = np.exp(-knn_sq_dists / (sigma ** 2))
+            with np.errstate(over="ignore", under="ignore"):
+                w_ij = np.exp(-(np.sqrt(knn_sq_dists) / sigma) ** 2)
+                base_downhill_w = np.where(downhill_mask, w_ij, 0.0)
+
+                # Rescale a row if all its eligible weights rounded to zero.
+                # The same factor cancels when the outgoing weights are normalized.
+                underflowed = downhill_mask.any(axis=1) & ~base_downhill_w.any(axis=1)
+                eligible_distances = np.where(
+                    downhill_mask[underflowed], knn_sq_dists[underflowed], np.inf
+                )
+                relative_distances = eligible_distances - eligible_distances.min(
+                    axis=1, keepdims=True
+                )
+                base_downhill_w[underflowed] = np.exp(
+                    -(np.sqrt(relative_distances) / sigma) ** 2
+                )
         else:
             w_ij = (knn_sq_dists == 0.0).astype(float)
+            base_downhill_w = np.where(downhill_mask, w_ij, 0.0)
 
         # Step 2: Initialize stored flux f_i(0) = 1
         flux = np.ones(n, dtype=float)
 
         # Step 3: Simulate flow for T iterations
-        tau = 0.1 * sigma
-        downhill_mask = d[knn_indices] <= (d[:, None] + tau)
-        base_downhill_w = np.where(downhill_mask, w_ij, 0.0)
-
         delta = np.zeros((n, k_eff), dtype=float)
         outgoing = np.zeros(n, dtype=float)
 
@@ -193,7 +210,7 @@ class FluxEquilibriumClustering:
             for node in path:
                 labels[node] = terminal_label
 
-        # Step 6: Post-processing - merge small clusters (< s_min) into nearest larger cluster
+        # Step 6: Merge clusters of size s_min or less into a larger cluster.
         s_min = max(2, n // 20)
         counts = np.bincount(labels)
         large_ids = np.flatnonzero(counts > s_min)
