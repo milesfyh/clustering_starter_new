@@ -103,18 +103,21 @@ class FluxEquilibriumClustering:
         graph[nodes[:, None], neighbors] = True
         graph |= graph.T
 
-        w_ij = np.zeros((n, n))
+        transport_weights = np.zeros((n, n))
         if sigma == 0:
             # In the zero-bandwidth limit, only coincident points have weight.
-            w_ij[graph] = squared_distances[graph] == 0
+            transport_weights[graph] = squared_distances[graph] == 0
         else:
-            w_ij[graph] = np.exp(-((np.sqrt(squared_distances[graph]) / sigma) ** 2))
+            scaled_distances = np.sqrt(squared_distances[graph]) / sigma
+            transport_weights[graph] = np.exp(-(scaled_distances ** 2))
+
+        w_ij = transport_weights[nodes[:, None], neighbors]
 
         # Rows are senders, and columns are receivers.
         downhill = centroid_distances[None, :] <= centroid_distances[:, None] + 0.1 * sigma
-        downhill_weights = w_ij * downhill
+        downhill_weights = transport_weights * downhill
         flux = np.ones(n)
-        delta = np.zeros_like(w_ij)
+        delta = np.zeros_like(downhill_weights)
         outgoing = np.zeros(n)
         for iteration in range(self.T):
             weights = downhill_weights
