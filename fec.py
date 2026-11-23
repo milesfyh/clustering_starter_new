@@ -83,6 +83,7 @@ class FluxEquilibriumClustering:
         n = len(X)
         nodes = np.arange(n)
         centroid_distances = np.linalg.norm(X - X.mean(axis=0), axis=1)
+
         squared_distances = np.empty((n, n))
         for i, point in enumerate(X):
             differences = X - point
@@ -105,7 +106,6 @@ class FluxEquilibriumClustering:
 
         transport_weights = np.zeros((n, n))
         if sigma == 0:
-            # In the zero-bandwidth limit, only coincident points have weight.
             transport_weights[graph] = squared_distances[graph] == 0
         else:
             scaled_distances = np.sqrt(squared_distances[graph]) / sigma
@@ -116,9 +116,12 @@ class FluxEquilibriumClustering:
         # Rows are senders, and columns are receivers.
         downhill = centroid_distances[None, :] <= centroid_distances[:, None] + 0.1 * sigma
         downhill_weights = transport_weights * downhill
+
         flux = np.ones(n)
         delta = np.zeros_like(downhill_weights)
         outgoing = np.zeros(n)
+        totals = np.zeros(n)
+
         for iteration in range(self.T):
             weights = downhill_weights
             if iteration > 0 and self.beta != 0:
@@ -130,9 +133,8 @@ class FluxEquilibriumClustering:
 
             totals = weights.sum(axis=1)
             outgoing = np.where(totals > 0, self.alpha * flux, 0.0)
-            # Normalize each sender's weights independently. Empty rows send zero.
             np.divide(weights, totals[:, None], out=delta, where=totals[:, None] > 0)
-            delta[totals == 0] = 0
+            delta[totals == 0] = 0.0
             delta *= outgoing[:, None]
             flux = (flux - outgoing) + delta.sum(axis=0)
 
@@ -140,10 +142,11 @@ class FluxEquilibriumClustering:
         if not sinks:
             sinks.append(int(centroid_distances.argmin()))
 
-        steepest = delta.argmax(axis=1)
-        steepest[outgoing == 0] = nodes[outgoing == 0]
+        steepest = np.where((totals > 0) & (outgoing > 0), delta.argmax(axis=1), nodes)
+
         labels = np.full(n, -1, dtype=int)
         labels[sinks] = np.arange(len(sinks))
+
         for start in nodes:
             current = start
             path = []
