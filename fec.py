@@ -48,8 +48,12 @@ class FluxEquilibriumClustering:
         epsilon: float = 1e-4,
         beta: Optional[float] = None,
     ) -> None:
-        # Hint: self.k = k, self.sigma = sigma, etc.
-        raise NotImplementedError
+        self.k = k
+        self.sigma = sigma
+        self.alpha = alpha
+        self.T = T
+        self.epsilon = epsilon
+        self.beta = beta
 
     def fit(self, X: np.ndarray) -> "FluxEquilibriumClustering":
         """Compute cluster labels for *X*.
@@ -72,8 +76,101 @@ class FluxEquilibriumClustering:
         The final labels must be stored in ``self.labels``.
         """
         # Hint: Start with computing centroid = X.mean(axis=0)
+        X = np.asarray(X, dtype=float)
+        if X.ndim != 2 or len(X) == 0:
+            raise ValueError("X must be a nonempty two-dimensional array")
 
-        # Add your code here
+        n = len(X)
+        nodes = np.arange(n)
+        centroid_distances = np.linalg.norm(X - X.mean(axis=0), axis=1)
+        squared_distances = np.empty((n, n))
+        for i, point in enumerate(X):
+            differences = X - point
+            squared_distances[i] = np.einsum("ij,ij->i", differences, differences)
+
+        sigma = self.sigma
+        if sigma is None:
+            if n > 1:
+                pairwise_distances = np.sqrt(squared_distances[np.triu_indices(n, k=1)])
+                sigma = 0.2 * np.median(pairwise_distances)
+            else:
+                sigma = 0.0
+
+        effective_k = min(self.k, n - 1)
+        np.fill_diagonal(squared_distances, np.inf)
+        neighbors = np.argsort(squared_distances, axis=1, kind="stable")[:, :effective_k].copy()
+        graph = np.zeros((n, n), dtype=bool)
+        graph[nodes[:, None], neighbors] = True
+        graph |= graph.T
+
+        w_ij = np.zeros((n, n))
+        if sigma == 0:
+            # In the zero-bandwidth limit, only coincident points have weight.
+            w_ij[graph] = squared_distances[graph] == 0
+        else:
+            w_ij[graph] = np.exp(-((np.sqrt(squared_distances[graph]) / sigma) ** 2))
+
+        # Rows are senders, and columns are receivers.
+        downhill = centroid_distances[None, :] <= centroid_distances[:, None] + 0.1 * sigma
+        downhill_weights = w_ij * downhill
+        flux = np.ones(n)
+        delta = np.zeros_like(w_ij)
+        outgoing = np.zeros(n)
+        for iteration in range(self.T):
+            weights = downhill_weights
+            if iteration > 0 and self.beta != 0:
+                if self.beta is None:
+                    reinforcement = np.log1p(flux)
+                else:
+                    reinforcement = flux ** self.beta
+                weights = downhill_weights * reinforcement[None, :]
+
+            totals = weights.sum(axis=1)
+            outgoing = np.where(totals > 0, self.alpha * flux, 0.0)
+            # Normalize each sender's weights independently. Empty rows send zero.
+            np.divide(weights, totals[:, None], out=delta, where=totals[:, None] > 0)
+            delta[totals == 0] = 0
+            delta *= outgoing[:, None]
+            flux = (flux - outgoing) + delta.sum(axis=0)
+
+        sinks = np.flatnonzero(outgoing < self.epsilon).tolist()
+        if not sinks:
+            sinks.append(int(centroid_distances.argmin()))
+
+        steepest = delta.argmax(axis=1)
+        steepest[outgoing == 0] = nodes[outgoing == 0]
+        labels = np.full(n, -1, dtype=int)
+        labels[sinks] = np.arange(len(sinks))
+        for start in nodes:
+            current = start
+            path = []
+            visited = set()
+            while labels[current] == -1:
+                visited.add(current)
+                path.append(current)
+                next_node = steepest[current]
+                if next_node in visited:
+                    labels[current] = len(sinks)
+                    sinks.append(int(current))
+                    break
+                current = next_node
+            labels[path] = labels[current]
+
+        min_size = max(2, n // 20)
+        counts = np.bincount(labels)
+        large_clusters = np.flatnonzero(counts >= min_size)
+        small_clusters = np.flatnonzero(counts < min_size)
+        if large_clusters.size and small_clusters.size:
+            centroids = np.zeros((len(counts), X.shape[1]))
+            np.add.at(centroids, labels, X)
+            centroids /= counts[:, None]
+            merged_labels = np.arange(len(counts))
+            for cluster in small_clusters:
+                distances = np.linalg.norm(centroids[large_clusters] - centroids[cluster], axis=1)
+                merged_labels[cluster] = large_clusters[distances.argmin()]
+            labels = merged_labels[labels]
+
+        sinks = np.asarray(sinks, dtype=int)
 
         # ---- DO NOT CHANGE THE REST OF THIS METHOD ---- #
         # We require you maintain these attributes for testing purpose.
